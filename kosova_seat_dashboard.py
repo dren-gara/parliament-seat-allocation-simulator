@@ -22,6 +22,7 @@ def dhondt_method(votes_dict, total_seats=100, threshold=0.05):
 
     return seats_allocated
 
+# Major parties with your specified colors
 KOSOVO_PARTIES = [
     {"name": "Vetëvendosje! (LVV)", "color": "#E30613"},
     {"name": "Partia Demokratike e Kosovës (PDK)", "color": "#3D76F0"},
@@ -41,7 +42,6 @@ def initialize_session_state():
         st.session_state.general_parties = [
             {**p, "percent": 10.0, "votes": 100000} for p in KOSOVO_PARTIES
         ]
-        st.session_state.num_general_parties = len(KOSOVO_PARTIES)
     if 'num_general_parties' not in st.session_state:
         st.session_state.num_general_parties = len(st.session_state.general_parties)
     if 'submitted' not in st.session_state:
@@ -61,10 +61,8 @@ def translate(key):
             "system_info": "Kosovo Electoral System Explanation",
             "system_text": """
 Kosovo's Assembly has **120 seats**:
-
 - **100 general seats** allocated using D'Hondt (5% threshold for all).
 - **20 reserved seats** (guaranteed): 10 for Serb community, 10 for others.
-
 In this simulator, Lista Serbe gets **10 reserved** for simplicity.
 A majority needs **61 seats**.
             """,
@@ -79,10 +77,8 @@ A majority needs **61 seats**.
             "system_info": "Shpjegim i Sistemit Zgjedhor",
             "system_text": """
 Kuvendi ka **120 ulëse**:
-
 - **100 ulëse të përgjithshme** me D'Hondt (prag 5%).
 - **20 ulëse të rezervuara**: 10 për serbët, 10 për të tjerët.
-
 Në këtë simulues, Lista Serbe merr **10 fikse të rezervuara** për thjeshtësi.
 Shumica kërkon **61 ulëse**.
             """,
@@ -94,28 +90,44 @@ Shumica kërkon **61 ulëse**.
     }
     return translations[st.session_state.language].get(key, key)
 
-def main():
-    st.set_page_config(page_title="Kosovo Election Simulator", layout="wide")
+def validate_inputs(parties):
+    # Check for duplicate party names
+    party_names = [p["name"] for p in parties]
+    if len(party_names) != len(set(party_names)):
+        st.error("Duplicate party names detected. Please use unique names.")
+        return False
     
-    initialize_session_state()
+    # Check for negative values
+    if st.session_state.input_mode_percent:
+        if any(p.get("percent", 0) < 0 for p in parties):
+            st.error("Percentages cannot be negative.")
+            return False
+    else:
+        if any(p.get("votes", 0) < 0 for p in parties):
+            st.error("Votes cannot be negative.")
+            return False
+    
+    return True
 
-    st.sidebar.selectbox("Gjuha / Language", ["English", "Shqip"], 
-                         index=0 if st.session_state.language == "English" else 1,
-                         key="lang_select")
-    st.session_state.language = st.session_state.lang_select
-
+def render_header():
     col1, col2 = st.columns([4, 1])
     with col1:
         st.title(translate("title"))
     with col2:
         st.image("logo.png", width=120)
-
     st.markdown(translate("desc"))
 
+def render_system_info():
     with st.expander(translate("system_info")):
         st.markdown(translate("system_text"))
 
+def render_sidebar_inputs():
     st.sidebar.header("Input Settings")
+    
+    st.sidebar.selectbox("Gjuha / Language", ["English", "Shqip"], 
+                         index=0 if st.session_state.language == "English" else 1,
+                         key="lang_select")
+    st.session_state.language = st.session_state.lang_select
     
     st.session_state.input_mode_percent = st.sidebar.checkbox(
         "Input as Vote Percentages (%)", value=True
@@ -129,7 +141,7 @@ def main():
 
     apply_threshold = st.sidebar.checkbox("Apply 5% threshold", value=True)
     threshold = 0.05 if apply_threshold else 0.0
-
+    
     st.sidebar.subheader("Parties (100 General Seats)")
     st.session_state.num_general_parties = st.sidebar.number_input(
         "Number of parties", min_value=1, max_value=20, value=st.session_state.num_general_parties
@@ -168,104 +180,129 @@ def main():
             if abs(total_percent - 100) > 0.1:
                 st.warning("Will be normalized proportionally.")
 
-        if st.form_submit_button("Calculate Seats"):
-            st.session_state.submitted = True
+        submitted = st.form_submit_button("Calculate Seats")
+        return submitted, threshold
+
+def compute_results(threshold):
+    if not validate_inputs(st.session_state.general_parties):
+        st.stop()
+
+    total_percent_calc = sum(p.get("percent", 0) for p in st.session_state.general_parties)
+    if st.session_state.input_mode_percent and total_percent_calc == 0:
+        st.error("No votes entered.")
+        st.stop()
+
+    if st.session_state.input_mode_percent:
+        scale = st.session_state.total_assumed_votes / total_percent_calc if total_percent_calc > 0 else 0
+        votes_dict = {p["name"]: p["percent"] * scale for p in st.session_state.general_parties}
+    else:
+        votes_dict = {p["name"]: p["votes"] for p in st.session_state.general_parties}
+
+    # Exclude Lista Serbe from general allocation
+    lista_votes = votes_dict.pop("Lista Serbe (Srpska Lista)", 0)
+
+    general_seats = dhondt_method(votes_dict, total_seats=100, threshold=threshold)
+
+    total_seats_dict = {party: general_seats.get(party, 0) for party in votes_dict}
+    total_seats_dict["Lista Serbe (Srpska Lista)"] = 10
+    total_seats_dict["Other Minorities"] = total_seats_dict.get("Other Minorities", 0) + 10
+
+    total_votes = sum(votes_dict.values()) + lista_votes
+    wasted_votes = int(sum(v for p, v in votes_dict.items() if p not in general_seats))
+    effective_threshold = (wasted_votes / total_votes * 100) if total_votes > 0 else 0
+
+    # Build table_data and chart_data_bar
+    table_data = []
+    chart_data_bar = []
+
+    # General seat winners
+    for party, g_seats in general_seats.items():
+        votes = votes_dict.get(party, 0)
+        perc = (votes / total_votes * 100) if total_votes > 0 else 0
+        t_seats = total_seats_dict.get(party, g_seats)
+        color = next((p["color"] for p in st.session_state.general_parties if p["name"] == party), "#808080")
+        table_data.append({
+            "Party": party,
+            "Vote %": f"{perc:.2f}%",
+            "Votes": f"{int(votes):,}",
+            "General Seats": g_seats,
+            "Reserved": 0,
+            "Total Seats": t_seats,
+        })
+        chart_data_bar.append({"Party": party, "Seats": t_seats, "Color": color})
+
+    # Lista Serbe
+    lista_perc = (lista_votes / total_votes * 100) if total_votes > 0 else 0
+    table_data.append({
+        "Party": "Lista Serbe (Srpska Lista)",
+        "Vote %": f"{lista_perc:.2f}%",
+        "Votes": f"{int(lista_votes):,}",
+        "General Seats": 0,
+        "Reserved": 10,
+        "Total Seats": 10,
+    })
+    chart_data_bar.append({"Party": "Lista Serbe (Srpska Lista)", "Seats": 10, "Color": "#000000"})
+
+    # Other Minorities
+    table_data.append({
+        "Party": "Other Minorities",
+        "Vote %": "-",
+        "Votes": "-",
+        "General Seats": 0,
+        "Reserved": 10,
+        "Total Seats": 10,
+    })
+    chart_data_bar.append({"Party": "Other Minorities", "Seats": 10, "Color": "#696969"})
+
+    return table_data, chart_data_bar, wasted_votes, effective_threshold, total_votes, total_seats_dict
+
+def render_results(table_data, chart_data_bar, wasted_votes, effective_threshold, total_votes):
+    st.subheader("Results (Full 120 Seats)")
+    
+    df_table = pd.DataFrame(table_data).sort_values("Total Seats", ascending=False)
+    st.dataframe(df_table, use_container_width=True)
+    
+    st.info(f"**Wasted votes** (below threshold): {wasted_votes:,} ({effective_threshold:.2f}%)")
+    st.info(f"Calculated turnout: {int(total_votes):,} votes")
+
+    st.write("**Total Seats in Parliament (120 seats)**")
+    df_bar = pd.DataFrame(chart_data_bar).sort_values("Seats", ascending=False)
+    bar = alt.Chart(df_bar).mark_bar().encode(
+        x=alt.X("Party:N", sort=None),
+        y=alt.Y("Seats:Q", title="Seats"),
+        color=alt.Color("Party:N", scale=alt.Scale(domain=df_bar["Party"].tolist(), range=df_bar["Color"].tolist()), legend=None),
+        tooltip=["Party", "Seats"]
+    ).properties(height=500)
+    st.altair_chart(bar, use_container_width=True)
+
+def render_coalition_builder(table_data, total_seats_dict):
+    st.subheader(translate("coalition_builder"))
+    coalition_parties = st.multiselect("Select parties for coalition", options=[row["Party"] for row in table_data])
+    if coalition_parties:
+        coalition_seats = sum(total_seats_dict.get(p, 0) for p in coalition_parties)
+        st.write(f"**{translate('majority')} {coalition_seats}**")
+        if coalition_seats >= 61:
+            st.success(translate("has_majority"))
+        else:
+            st.warning(f"{translate('needs')} ({61 - coalition_seats} more)")
+
+def main():
+    st.set_page_config(page_title="Kosovo Election Simulator", layout="wide")
+    
+    initialize_session_state()
+
+    render_header()
+    render_system_info()
+    submitted, threshold = render_sidebar_inputs()
+    
+    if submitted:
+        st.session_state.submitted = True
 
     if st.session_state.submitted:
-        total_percent_calc = sum(p.get("percent", 0) for p in st.session_state.general_parties)
-        if st.session_state.input_mode_percent and total_percent_calc == 0:
-            st.error("No votes entered.")
-            st.stop()
-
-        if st.session_state.input_mode_percent:
-            scale = st.session_state.total_assumed_votes / total_percent_calc if total_percent_calc > 0 else 0
-            votes_dict = {p["name"]: p["percent"] * scale for p in st.session_state.general_parties}
-        else:
-            votes_dict = {p["name"]: p["votes"] for p in st.session_state.general_parties}
-
-        # Exclude Lista Serbe from general allocation
-        lista_votes = votes_dict.pop("Lista Serbe (Srpska Lista)", 0)
-
-        general_seats = dhondt_method(votes_dict, total_seats=100, threshold=threshold)
-
-        total_seats_dict = {party: general_seats.get(party, 0) for party in votes_dict}
-        total_seats_dict["Lista Serbe (Srpska Lista)"] = 10
-        total_seats_dict["Other Minorities"] = total_seats_dict.get("Other Minorities", 0) + 10
-
-        total_votes = sum(votes_dict.values()) + lista_votes
-        wasted_votes = int(sum(v for p, v in votes_dict.items() if p not in general_seats))
-        effective_threshold = (wasted_votes / total_votes * 100) if total_votes > 0 else 0
-
-        st.subheader("Results (Full 120 Seats)")
-
-        table_data = []
-        chart_data_bar = []
-
-        # General seat winners
-        for party, g_seats in general_seats.items():
-            votes = votes_dict.get(party, 0)
-            perc = (votes / total_votes * 100) if total_votes > 0 else 0
-            t_seats = total_seats_dict.get(party, g_seats)
-            color = next((p["color"] for p in st.session_state.general_parties if p["name"] == party), "#808080")
-            table_data.append({
-                "Party": party,
-                "Vote %": f"{perc:.2f}%",
-                "Votes": f"{int(votes):,}",
-                "General Seats": g_seats,
-                "Reserved": 0,
-                "Total Seats": t_seats,
-            })
-            chart_data_bar.append({"Party": party, "Seats": t_seats, "Color": color})
-
-        # Lista Serbe (fixed 10 seats)
-        lista_perc = (lista_votes / total_votes * 100) if total_votes > 0 else 0
-        table_data.append({
-            "Party": "Lista Serbe (Srpska Lista)",
-            "Vote %": f"{lista_perc:.2f}%",
-            "Votes": f"{int(lista_votes):,}",
-            "General Seats": 0,
-            "Reserved": 10,
-            "Total Seats": 10,
-        })
-        chart_data_bar.append({"Party": "Lista Serbe (Srpska Lista)", "Seats": 10, "Color": "#002395"})
-
-        # Other Minorities (fixed 10 seats)
-        table_data.append({
-            "Party": "Other Minorities",
-            "Vote %": "-",
-            "Votes": "-",
-            "General Seats": 0,
-            "Reserved": 10,
-            "Total Seats": 10,
-        })
-        chart_data_bar.append({"Party": "Other Minorities", "Seats": 10, "Color": "#696969"})  # Dim gray
-
-        df_table = pd.DataFrame(table_data).sort_values("Total Seats", ascending=False)
-        st.dataframe(df_table, use_container_width=True)
-
-        st.info(f"**Wasted votes** (below threshold): {wasted_votes:,} ({effective_threshold:.2f}%)")
-        st.info(f"Calculated turnout: {int(total_votes):,} votes")
-
-        # Single full-width bar chart including minorities
-        st.write("**Total Seats in Parliament (120 seats)**")
-        df_bar = pd.DataFrame(chart_data_bar).sort_values("Seats", ascending=False)
-        bar = alt.Chart(df_bar).mark_bar().encode(
-            x=alt.X("Party:N", sort=None),
-            y=alt.Y("Seats:Q", title="Seats"),
-            color=alt.Color("Party:N", scale=alt.Scale(domain=df_bar["Party"].tolist(), range=df_bar["Color"].tolist()), legend=None),
-            tooltip=["Party", "Seats"]
-        ).properties(height=500, width=800)
-        st.altair_chart(bar, use_container_width=True)
-
-        st.subheader(translate("coalition_builder"))
-        coalition_parties = st.multiselect("Select parties for coalition", options=[row["Party"] for row in table_data])
-        if coalition_parties:
-            coalition_seats = sum(total_seats_dict.get(p, 0) for p in coalition_parties)
-            st.write(f"**{translate('majority')} {coalition_seats}**")
-            if coalition_seats >= 61:
-                st.success(translate("has_majority"))
-            else:
-                st.warning(f"{translate('needs')} ({61 - coalition_seats} more)")
+        results = compute_results(threshold)
+        table_data, chart_data_bar, wasted_votes, effective_threshold, total_votes, total_seats_dict = results
+        render_results(table_data, chart_data_bar, wasted_votes, effective_threshold, total_votes)
+        render_coalition_builder(table_data, total_seats_dict)
 
     st.sidebar.markdown("### Instructions / Udhëzime")
     st.sidebar.markdown("1. Enter party names, percentages (or votes), and colors.\n2. Click **Calculate Seats** to see results.\n3. Lista Serbe gets 0 general + 10 reserved seats.")
